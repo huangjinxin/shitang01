@@ -24,6 +24,9 @@ yarn-error.log*
 .env*.local
 !.env.example
 
+# 本地发布备注（含账号/Token 等敏感信息，绝不提交）
+/.local/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

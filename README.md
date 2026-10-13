@@ -176,3 +176,7 @@ pg_restore -d "postgresql://postgres@localhost:5432/school_canteen_restore" --cl
 6. 正式营养数据来源（替换演示占位值）
 
 以上在权威来源核实前，系统不会硬编码为“国家要求”，均以“待配置/待确认”呈现。
+
+## 发布 / 上传到 GitHub
+
+推送步骤见 [`docs/RELEASE.md`](docs/RELEASE.md)。仓库地址、账号与 Token 等敏感信息保存在**本地** `.local/upload-notes.md`（已被 `.gitignore` 忽略，不会提交或上传）。切勿将 `.env`、`.local/` 或 Token 提交到仓库。
