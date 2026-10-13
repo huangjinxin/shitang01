@@ -1,0 +1,652 @@
+// 食堂食谱管理与营养分析 —— 数据模型
+// 注意：营养标准、法规阈值等“待核实规则”不在此硬编码，统一进入配置表并标记状态。
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// 审核 / 数据可信状态
+enum DataStatus {
+  CONFIRMED // 已确认
+  PENDING // 待配置 / 待确认
+  MISSING // 缺失
+}
+
+enum MenuStatus {
+  DRAFT // 草稿
+  CONFIRMED // 已确认
+  ARCHIVED // 已归档
+}
+
+enum ImportStatus {
+  PENDING // 已上传，待解析
+  PARSED // 已解析，待人工核对
+  IMPORTED // 已确认导入
+  FAILED // 解析失败
+}
+
+enum Severity {
+  INFO
+  WARNING
+  ERROR
+}
+
+/// 计量单位种类：质量/体积/个数/包装，便于区分“可换算”与“需人工确认”
+enum UnitKind {
+  MASS
+  VOLUME
+  COUNT
+  PACKAGE
+}
+
+/// 营养素分类
+enum NutrientCategory {
+  ENERGY
+  MACRO
+  MINERAL
+  VITAMIN
+}
+
+// ---------------------------------------------------------------------------
+// 基础信息
+// ---------------------------------------------------------------------------
+
+model School {
+  id            String   @id @default(cuid())
+  name          String
+  code          String?
+  address       String?
+  contactPerson String?
+  contactPhone  String?
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  campuses Campus[]
+}
+
+model Campus {
+  id       String  @id @default(cuid())
+  schoolId String
+  name     String
+  note     String?
+
+  school School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  menus  Menu[]
+
+  dailyMenuLogs    DailyMenuLog[]
+  foodAcceptances  FoodAcceptance[]
+  foodSamples      FoodSample[]
+  sanitationLogs   SanitationLog[]
+  healthChecks     HealthCheck[]
+  safetyInspections SafetyInspection[]
+  purchaseArrivals PurchaseArrival[]
+
+  @@unique([schoolId, name])
+}
+
+/// 供餐对象 / 年龄组（幼儿园、小学、初中等，规则可配置）
+model AgeGroup {
+  id           String  @id @default(cuid())
+  name         String
+  stage        String? // 幼儿园 / 小学 / 初中 …
+  minAgeMonths Int?
+  maxAgeMonths Int?
+  note         String?
+  createdAt    DateTime @default(now())
+
+  menus         Menu[]
+  dailyMenuLogs DailyMenuLog[]
+}
+
+/// 餐次（早餐/午餐/午点…）可配置
+model MealPeriod {
+  id        String  @id @default(cuid())
+  name      String  @unique
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+  note      String?
+
+  slots       MealSlot[]
+  serveCounts ServingCount[]
+  dailyMenuLogs DailyMenuLog[]
+  foodSamples   FoodSample[]
+}
+
+/// 计量单位
+model Unit {
+  id       String   @id @default(cuid())
+  name     String   @unique // 克 / 斤 / 杯 / 个 …
+  symbol   String?
+  kind     UnitKind
+  isBase   Boolean  @default(false) // 是否为该 kind 的基准单位（如 克）
+  note     String?
+
+  fromConversions UnitConversion[] @relation("fromUnit")
+  toConversions   UnitConversion[] @relation("toUnit")
+  ingredients     Ingredient[]
+  dishIngredients DishIngredient[]
+  foodAcceptances FoodAcceptance[]
+}
+
+/// 单位换算（必须可审计：带来源、生效日期与状态）
+model UnitConversion {
+  id            String     @id @default(cuid())
+  fromUnitId    String
+  toUnitId      String
+  factor        Float // 1 fromUnit = factor toUnit
+  status        DataStatus @default(PENDING)
+  source        String? // 换算依据来源（标准/称重/校方规定…）
+  effectiveDate DateTime?
+  note          String?
+
+  fromUnit Unit @relation("fromUnit", fields: [fromUnitId], references: [id])
+  toUnit   Unit @relation("toUnit", fields: [toUnitId], references: [id])
+
+  @@unique([fromUnitId, toUnitId])
+}
+
+model IngredientCategory {
+  id        String @id @default(cuid())
+  name      String @unique
+  sortOrder Int    @default(0)
+
+  ingredients Ingredient[]
+}
+
+model Allergen {
+  id   String  @id @default(cuid())
+  name String  @unique
+  note String?
+
+  ingredients IngredientAllergen[]
+}
+
+/// 食材字典
+model Ingredient {
+  id              String  @id @default(cuid())
+  name            String  @unique
+  categoryId      String?
+  defaultUnitId   String?
+  note            String?
+  isActive        Boolean @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  category    IngredientCategory? @relation(fields: [categoryId], references: [id])
+  defaultUnit Unit?               @relation(fields: [defaultUnitId], references: [id])
+
+  allergens   IngredientAllergen[]
+  nutrients   IngredientNutrient[]
+  dishLines   DishIngredient[]
+  acceptances FoodAcceptance[]
+}
+
+model IngredientAllergen {
+  ingredientId String
+  allergenId   String
+  note         String?
+
+  ingredient Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+  allergen   Allergen   @relation(fields: [allergenId], references: [id], onDelete: Cascade)
+
+  @@id([ingredientId, allergenId])
+}
+
+// ---------------------------------------------------------------------------
+// 营养成分及数据来源 / 版本
+// ---------------------------------------------------------------------------
+
+model NutrientSource {
+  id            String   @id @default(cuid())
+  name          String // 例如《中国食物成分表》标准版第6版
+  publisher     String?
+  version       String
+  publishedAt   DateTime?
+  effectiveDate DateTime?
+  sourceUrl     String?
+  scope         String? // 适用范围
+  note          String?
+  status        DataStatus @default(PENDING) // 待核实来源默认 PENDING
+  createdAt     DateTime @default(now())
+
+  values IngredientNutrient[]
+
+  @@unique([name, version])
+}
+
+model Nutrient {
+  id        String           @id @default(cuid())
+  code      String           @unique // energy_kcal / protein / fat / carb …
+  name      String
+  unit      String // g / mg / μg / kcal
+  category  NutrientCategory
+  sortOrder Int              @default(0)
+
+  values IngredientNutrient[]
+}
+
+model IngredientNutrient {
+  id            String     @id @default(cuid())
+  ingredientId  String
+  nutrientId    String
+  amountPer100g Float
+  sourceId      String
+  status        DataStatus @default(PENDING)
+  note          String?
+  updatedAt     DateTime   @updatedAt
+
+  ingredient Ingredient     @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+  nutrient   Nutrient       @relation(fields: [nutrientId], references: [id])
+  source     NutrientSource @relation(fields: [sourceId], references: [id])
+
+  @@unique([ingredientId, nutrientId, sourceId])
+}
+
+// ---------------------------------------------------------------------------
+// 菜单 / 食谱
+// ---------------------------------------------------------------------------
+
+model Menu {
+  id          String     @id @default(cuid())
+  name        String
+  campusId    String
+  ageGroupId  String?
+  startDate   DateTime
+  endDate     DateTime
+  status      MenuStatus @default(DRAFT)
+  note        String?
+  createdBy   String?
+  updatedBy   String?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  sourceImportJobId String?
+
+  campus   Campus    @relation(fields: [campusId], references: [id])
+  ageGroup AgeGroup? @relation(fields: [ageGroupId], references: [id])
+
+  days        MenuDay[]
+  serveCounts ServingCount[]
+  dailyMenuLogs DailyMenuLog[]
+}
+
+model MenuDay {
+  id     String   @id @default(cuid())
+  menuId String
+  date   DateTime
+  note   String?
+
+  menu  Menu       @relation(fields: [menuId], references: [id], onDelete: Cascade)
+  slots MealSlot[]
+  serveCounts ServingCount[]
+
+  @@unique([menuId, date])
+}
+
+model MealSlot {
+  id           String @id @default(cuid())
+  menuDayId    String
+  mealPeriodId String
+  note         String?
+
+  menuDay    MenuDay    @relation(fields: [menuDayId], references: [id], onDelete: Cascade)
+  mealPeriod MealPeriod @relation(fields: [mealPeriodId], references: [id])
+  dishes     Dish[]
+
+  @@unique([menuDayId, mealPeriodId])
+}
+
+/// 标准菜品库（用于“疑似重复菜品”提示与复用）
+model DishLibrary {
+  id       String  @id @default(cuid())
+  name     String  @unique
+  category String?
+  note     String?
+
+  dishes Dish[]
+}
+
+model Dish {
+  id            String @id @default(cuid())
+  mealSlotId    String
+  name          String
+  dishLibraryId String?
+  note          String?
+  sortOrder     Int    @default(0)
+
+  mealSlot    MealSlot     @relation(fields: [mealSlotId], references: [id], onDelete: Cascade)
+  dishLibrary DishLibrary? @relation(fields: [dishLibraryId], references: [id])
+  ingredients DishIngredient[]
+}
+
+/// 菜谱原料及每人份量
+model DishIngredient {
+  id           String     @id @default(cuid())
+  dishId       String
+  ingredientId String? // 未匹配时为 null，需人工确认
+  rawName      String // 原始文本中的食材名（保留原值）
+  quantity     Float? // 解析后的数量（每人份）
+  unitId       String?
+  rawQuantity  String? // 原始数量文本，保留错位/异常原貌
+  perPerson    Boolean    @default(true)
+  status       DataStatus @default(PENDING)
+  note         String?
+
+  dish       Dish        @relation(fields: [dishId], references: [id], onDelete: Cascade)
+  ingredient Ingredient? @relation(fields: [ingredientId], references: [id])
+  unit       Unit?       @relation(fields: [unitId], references: [id])
+}
+
+/// 供餐人数（可按日、按餐次、按年龄组）
+model ServingCount {
+  id           String  @id @default(cuid())
+  menuId       String?
+  menuDayId    String?
+  mealPeriodId String?
+  count        Int
+  note         String?
+
+  menu       Menu?        @relation(fields: [menuId], references: [id], onDelete: Cascade)
+  menuDay    MenuDay?     @relation(fields: [menuDayId], references: [id], onDelete: Cascade)
+  mealPeriod MealPeriod?  @relation(fields: [mealPeriodId], references: [id])
+}
+
+// ---------------------------------------------------------------------------
+// 导入任务
+// ---------------------------------------------------------------------------
+
+model ImportJob {
+  id            String       @id @default(cuid())
+  fileName      String
+  fileType      String // xlsx / docx / doc / csv
+  storedPath    String? // 原始文件保存路径（保留原文件）
+  fileSize      Int?
+  status        ImportStatus @default(PENDING)
+  parserVersion String?
+  detectedLayout String? // 识别出的版式描述
+  note          String?
+  createdBy     String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  errors ImportError[]
+}
+
+/// 导入问题（保留原值/解析值，禁止静默修好）
+model ImportError {
+  id          String   @id @default(cuid())
+  importJobId String
+  severity    Severity
+  sheetName   String?
+  rowRef      String?
+  columnRef   String?
+  field       String?
+  message     String
+  rawValue    String?
+  parsedValue String?
+  resolved    Boolean  @default(false)
+  resolution  String?
+  createdAt   DateTime @default(now())
+
+  importJob ImportJob @relation(fields: [importJobId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// 操作记录
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  entity    String
+  entityId  String
+  action    String
+  actor     String
+  detail    String?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// 后厨日常登记（记录均有外键、状态、创建/更新时间，并支持软删除）
+// 说明：删除采用软删除（deletedAt）；所有增删改写入 AuditLog。
+// ---------------------------------------------------------------------------
+
+/// 记录业务状态：草稿 / 已提交 / 需整改 / 已完成 / 已作废
+enum RecordStatus {
+  DRAFT
+  SUBMITTED
+  NEEDS_FIX
+  DONE
+  VOID
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum AcceptanceResult {
+  PASS
+  FAIL
+  PARTIAL
+}
+
+/// 每日食谱登记（后厨实际供餐记录，可选关联已制定食谱）
+model DailyMenuLog {
+  id           String   @id @default(cuid())
+  date         DateTime
+  campusId     String
+  ageGroupId   String?
+  mealPeriodId String?
+  menuId       String?
+  dishesText   String?
+  ingredientsText String?
+  servings     Int?
+  note         String?
+  registrant   String
+  status       RecordStatus @default(SUBMITTED)
+  createdBy    String?
+  updatedBy    String?
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campus     Campus      @relation(fields: [campusId], references: [id])
+  ageGroup   AgeGroup?   @relation(fields: [ageGroupId], references: [id])
+  mealPeriod MealPeriod? @relation(fields: [mealPeriodId], references: [id])
+  menu       Menu?       @relation(fields: [menuId], references: [id])
+
+  @@index([date])
+  @@index([campusId])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+/// 食材验收登记
+model FoodAcceptance {
+  id           String   @id @default(cuid())
+  occurredAt   DateTime
+  campusId     String
+  supplier     String
+  ingredientId String?
+  ingredientName String
+  spec         String?
+  quantity     Float?
+  unitId       String?
+  result       AcceptanceResult @default(PASS)
+  issueDesc    String?
+  handling     String?
+  attachmentPath String? // 照片附件路径（受限于当前无对象存储，仅记录本机路径）
+  registrant   String
+  status       RecordStatus @default(SUBMITTED)
+  createdBy    String?
+  updatedBy    String?
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campus     Campus      @relation(fields: [campusId], references: [id])
+  ingredient Ingredient? @relation(fields: [ingredientId], references: [id])
+  unit       Unit?       @relation(fields: [unitId], references: [id])
+  arrivals   PurchaseArrival[]
+
+  @@index([occurredAt])
+  @@index([campusId])
+  @@index([supplier])
+  @@index([ingredientName])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+/// 食品留样登记
+model FoodSample {
+  id           String   @id @default(cuid())
+  occurredAt   DateTime
+  campusId     String
+  dishName     String
+  mealPeriodId String?
+  sampleAmount String?
+  containerNo  String?
+  storageLocation String?
+  sampler      String
+  handleTime   DateTime?
+  note         String?
+  status       RecordStatus @default(SUBMITTED)
+  createdBy    String?
+  updatedBy    String?
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campus     Campus      @relation(fields: [campusId], references: [id])
+  mealPeriod MealPeriod? @relation(fields: [mealPeriodId], references: [id])
+
+  @@index([occurredAt])
+  @@index([campusId])
+  @@index([dishName])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+/// 餐具与环境消毒登记
+model SanitationLog {
+  id           String   @id @default(cuid())
+  occurredAt   DateTime
+  campusId     String
+  area         String
+  method       String
+  startTime    String?
+  endTime      String?
+  operator     String
+  checkResult  String?
+  exceptionNote String?
+  status       RecordStatus @default(SUBMITTED)
+  createdBy    String?
+  updatedBy    String?
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campus Campus @relation(fields: [campusId], references: [id])
+
+  @@index([occurredAt])
+  @@index([campusId])
+  @@index([area])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+/// 从业人员晨检 / 健康登记（敏感信息：列表页不展示异常详情）
+model HealthCheck {
+  id           String   @id @default(cuid())
+  date         DateTime
+  campusId     String
+  personName   String
+  checkResult  String
+  abnormalNote String? // 敏感字段，仅在详情页展示
+  handling     String?
+  registrant   String
+  status       RecordStatus @default(SUBMITTED)
+  createdBy    String?
+  updatedBy    String?
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campus Campus @relation(fields: [campusId], references: [id])
+
+  @@index([date])
+  @@index([campusId])
+  @@index([personName])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+/// 厨房安全巡查 / 异常事件登记
+model SafetyInspection {
+  id           String   @id @default(cuid())
+  occurredAt   DateTime
+  campusId     String
+  checkItem    String
+  result       String
+  riskLevel    RiskLevel @default(LOW)
+  problemDesc  String?
+  rectification String?
+  owner        String?
+  dueDate      DateTime?
+  completionStatus RecordStatus @default(SUBMITTED)
+  reinspection String?
+  registrant   String
+  status       RecordStatus @default(SUBMITTED)
+  createdBy    String?
+  updatedBy    String?
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campus Campus @relation(fields: [campusId], references: [id])
+
+  @@index([occurredAt])
+  @@index([campusId])
+  @@index([riskLevel])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+/// 供应商与采购到货登记
+model PurchaseArrival {
+  id           String   @id @default(cuid())
+  date         DateTime
+  campusId     String
+  supplier     String
+  ingredientName String
+  quantity     Float?
+  unitName     String?
+  batchNote    String?
+  acceptanceId String?
+  note         String?
+  registrant   String
+  status       RecordStatus @default(SUBMITTED)
+  createdBy    String?
+  updatedBy    String?
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  campus     Campus          @relation(fields: [campusId], references: [id])
+  acceptance FoodAcceptance? @relation(fields: [acceptanceId], references: [id])
+
+  @@index([date])
+  @@index([campusId])
+  @@index([supplier])
+  @@index([ingredientName])
+  @@index([status])
+  @@index([deletedAt])
+}
